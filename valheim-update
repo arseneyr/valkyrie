@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+readonly MANIFEST="$VALHEIM_INSTALL_PATH"/steamapps/appmanifest_896660.acf
+readonly VALHEIM_BRANCH="${VALHEIM_BRANCH:-public}"
+
+update_server() {
+	/opt/steamcmd/steamcmd.sh +force_install_dir "$VALHEIM_INSTALL_PATH" +login anonymous +app_update 896660 +quit
+}
+
+is_up_to_date() {
+	local installed_buildid
+	if [ -f "$manifest" ]; then
+		installed_buildid="$(grep -Eo '"buildid".*' "$manifest" | grep -Eo '[[:digit:]]+')"
+	fi
+	local latest_buildid
+	latest_buildid="$(curl -sL https://api.steamcmd.net/v1/info/896660 | jq -r '.data."896660".depots.branches.'"$valheim_branch"'.buildid')"
+
+	[ "$installed_buildid" = "$latest_buildid" ]
+}
+
+(return 0 2>/dev/null) || update_server

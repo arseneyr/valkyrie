@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+
+source /usr/local/bin/valheim-update
+
+# set -x
+
+declare -r WORLD_NAME=${WORLD_NAME:-Dedicated}
+declare -r SERVER_NAME=${SERVER_NAME:-My server}
+declare -r SERVER_PASS=${SERVER_PASS-secret}
+declare -ir SERVER_PORT=${SERVER_PORT:-2456}
+declare -r CROSSPLAY=${CROSSPLAY:-false}
+declare SERVER_PUBLIC=${SERVER_PUBLIC:-1}
+declare -ir IDLE_DATAGRAM_WINDOW=${IDLE_DATAGRAM_WINDOW:-3}
+declare -ir IDLE_DATAGRAM_COUNT=${IDLE_DATAGRAM_COUNT:-30}
+declare -ir IDLE_CHECK_INTERVAL=${IDLE_CHECK_INTERVAL:-120}
+declare -ir SERVER_QUERY_PORT=$((SERVER_PORT + 1))
+IFS=' ' read -r -a SERVER_ARGS <<< "$SERVER_ARGS"
+[ "$CROSSPLAY" = true ] && SERVER_ARGS+=(-crossplay)
+readonly SERVER_ARGS
+[ "$SERVER_PUBLIC" = true ] && SERVER_PUBLIC=1
+[ "$SERVER_PUBLIC" = false ] && SERVER_PUBLIC=0
+readonly SERVER_PUBLIC
+
+run=true
+
+export LD_LIBRARY_PATH="$VALHEIM_INSTALL_PATH/linux64:$LD_LIBRARY_PATH"
+export SteamAppId=892970
+
+if [ "$FLY_ALLOC_ID" ]; then
+	export LD_PRELOAD=bind.so
+	export BIND_ADDR=fly-global-services
+fi
+
+start() {
+	"$VALHEIM_INSTALL_PATH"/valheim_server.x86_64 \
+		-nographics -batchmode \
+		-savedir /config \
+		-name "$SERVER_NAME" \
+		-password "$SERVER_PASS" \
+		-public "$SERVER_PUBLIC" \
+		-port "$SERVER_PORT" \
+		-world "$WORLD_NAME" \
+		"${SERVER_ARGS[@]}" &
+
+	server_pid=$!
+}
+
+server_is_listening() {
+    # Check if server is listening on either server or query port
+    # since crossplay-enabled servers don't listen on $SERVER_PORT
+    
+    awk -v server_port="$SERVER_PORT" -v server_query_port="$SERVER_QUERY_PORT" '
+        BEGIN {
+            exit_code = 1
+        }
+        {
+            if ($1 ~ /^[0-9]/) {
+                split($2, local_bind, ":")
+                listening_port = sprintf("%d", "0x" local_bind[2])
+                if (listening_port == server_query_port || listening_port == server_port) {
+                    exit_code = 0
+                    exit
+                }
+            }
+        }
+        END {
+            exit exit_code
+        }
+    ' /proc/net/udp*
+}
+
+wait_for_server_listening() {
+    while :; do
+        if server_is_listening; then
+            break
+        elif ! sleep 5; then
+					return
+        fi
+    done
+}
+
+udp_datagram_count() {
+	local datagram_count
+	datagram_count="$(nstat | awk '/UdpInDatagrams/{print $2}' | tr -d ' ')"
+	echo "${datagram_count:-0}"
+}
+
+is_idle() {
+	udp_datagram_count &>/dev/null
+	sleep "$IDLE_DATAGRAM_WINDOW"
+	[ "$(udp_datagram_count)" -le "$IDLE_DATAGRAM_COUNT" ]
+}
+
+main() {
+	start
+
+	if ! is_up_to_date; then
+		shutdown TERM
+		if ! update_server; then
+			return
+		fi
+		start
+	fi
+
+	trap _trap SIGINT SIGTERM
+	if ! wait_for_server_listening; then
+		return
+	fi
+	while [ "$run" = true ]; do
+		if sleep "$IDLE_CHECK_INTERVAL" && is_idle; then
+			break
+		fi
+	done
+	shutdown
+}
+
+shutdown() {
+	local sig="${1:-INT}"
+	if [ "$server_pid" ]; then
+		kill -"$sig" "$server_pid" 2>/dev/null
+		wait -f "$server_pid"
+		server_pid=
+	fi
+}
+
+_trap() {
+	run=false
+	shutdown
+}
+
+main
